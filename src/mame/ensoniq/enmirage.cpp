@@ -53,14 +53,15 @@
 
     Keyboard models talk to the R6500/11 through the VIA shifter: CA2 is handshake, CB1 is shift clock,
     CB2 is shift data.
-    This is unconnected on the rackmount version.
+    This is unconnected on the rackmount version.  A stand-in for the R6500/11 is
+    provided that plays a MIDI file (-kbdin) into the shifter.
 
     Unimplemented:
         * Four Pole Low-Pass Voltage Controlled Filter section
         * External sync signal
         * Foot pedal
         * ADC feedback
-        * Piano keyboard controller
+        * Piano keyboard controller (only the stand-in described above)
         * Expansion connector
         * Stereo output
 
@@ -73,6 +74,7 @@
 #include "formats/esq8_dsk.h"
 #include "imagedev/cassette.h"
 #include "imagedev/floppy.h"
+#include "imagedev/midiin.h"
 #include "machine/6522via.h"
 #include "machine/6850acia.h"
 #include "machine/clock.h"
@@ -86,20 +88,460 @@
 
 #define LOG_ADC_READ        (1U << 1)
 #define LOG_FILTER_WRITE    (1U << 2)
+#define LOG_KBD             (1U << 3)
 #define VERBOSE (0)
 //#define VERBOSE (LOG_ADC_READ)
 //#define VERBOSE (LOG_ADC_READ|LOG_FILTER_WRITE)
+//#define VERBOSE (LOG_KBD)
 
 #include "logmacro.h"
 
 #define LOGADCREAD(...)     LOGMASKED(LOG_ADC_READ, __VA_ARGS__)
 #define LOGFILTERWRITE(...) LOGMASKED(LOG_FILTER_WRITE, __VA_ARGS__)
+#define LOGKBD(...)         LOGMASKED(LOG_KBD, __VA_ARGS__)
 
 
 namespace {
 
 #define PITCH_TAG "pitch"
 #define MOD_TAG "mod"
+
+/***************************************************************************
+    Keyboard controller stand-in
+
+    The DSK-8's 61-key keyboard is scanned by an R6500/11 microcontroller
+    that reports to the CPU through the VIA's shift register: the
+    controller's SCLK output is the VIA's CB1 input, its SDATA output is
+    CB2, and the VIA's CA2 output is the controller's /SACK handshake input.
+    The rackmount DMS-8 has no keyboard, so nothing in this driver could
+    originate a note.
+
+    This device does not emulate the R6500/11, whose firmware is not
+    available.  It reproduces the controller's output protocol instead, which
+    the OS fixes completely:
+
+    * Messages are MIDI-like: 0x90 key velocity for note on, 0x80 key
+      velocity for note off, 0xb8 for sustain pedal down and 0xb9 for pedal
+      up.  The pedal messages carry no data bytes.
+    * Key numbers count from 0 at the bottom of the 61 keys, and the OS adds
+      0x24, so key 0 is MIDI note 36 and key 60 is MIDI note 96.
+    * The velocity byte is the controller's raw timing count.  The OS maps it
+      through a curve in the boot ROM (one table for attack at 0xfbf8, one
+      for release at 0xfbfe), adds the sensitivity setting less 0x1e and
+      clamps the result to 0x01-0x7f.  The device finds the raw byte that
+      gives a requested MIDI velocity by inverting the curve in the loaded
+      ROM region at start-up, so no ROM data is needed in this file.
+    * One byte is delivered per VIA shift register interrupt (ACR = 0xcc:
+      shift in under the external clock on CB1).  After each byte the OS
+      pulses CA2 low then high to release the next one, and withholds the
+      pulse when its event pool runs low, which is the only flow control.
+      A byte is therefore shifted out only after a falling edge on /SACK
+      has been seen since the previous byte.
+
+    These parts of the protocol are assumed rather than known, since the
+    controller's firmware cannot be inspected: the bit order and polarity
+    (most significant bit first, positive logic, which follows from the 6522
+    shifting MSB first and the OS using the byte unmodified), the bit clock
+    (10us per bit, which the OS is insensitive to), the controller's
+    reaction time after /SACK (50us, which must exceed the roughly 15 CPU
+    cycles between the OS handing over and discarding its first read of the
+    shift register), and that every event begins with a status byte rather
+    than using MIDI-style running status (the OS accepts either).
+
+    Input is a MIDI file given with -kbdin.  A midiin image device parses the
+    file and streams it as MIDI serial data, and this device decodes the
+    bytes and translates note on/off and controller 64 into keyboard
+    controller events.  The ACIA's own -midiin option is not affected, so a
+    file can drive either the MIDI IN port or the keyboard.
+
+    The velocity curves come from the boot ROM, so -kbdin refuses its image
+    if the ROM does not have curve-shaped tables where this device looks.
+
+***************************************************************************/
+
+// Where the boot ROM keeps its velocity curves.  Each is a table indexed by
+// the controller's raw byte, with the release table starting six entries
+// after the attack table.  Only the monotonic prefix is the curve - past it
+// the table runs into code - so a curve ends at the first decrease or at a
+// value above 0x7f.  The check is that something curve-shaped is there
+// (long enough, and wide enough to cover most of the MIDI velocity range),
+// not which ROM it is: another revision with these tables in these places
+// is accepted, one without them is not.
+struct velocity_curve
+{
+	unsigned offset;
+	const char *name;
+};
+
+const velocity_curve VELOCITY_CURVES[2] = {
+	{ 0xbf8, "attack"  },
+	{ 0xbfe, "release" },
+};
+
+constexpr unsigned MIN_CURVE_LENGTH = 64;
+constexpr unsigned MIN_CURVE_RANGE  = 64;
+
+// Length of the curve at an offset in the boot ROM, or 0 if there is none
+unsigned velocity_curve_length(memory_region *rom, unsigned offset)
+{
+	if (!rom || rom->bytes() <= offset)
+		return 0;
+
+	const uint8_t *curve = rom->base() + offset;
+	unsigned len = 1;
+	while (len < 0x100 && (offset + len) < rom->bytes() && curve[len] >= curve[len - 1] && curve[len] <= 0x7f)
+		len++;
+	if (curve[0] > 0x7f || len < MIN_CURVE_LENGTH || (curve[len - 1] - curve[0]) < MIN_CURVE_RANGE)
+		return 0;
+	return len;
+}
+
+// The MIDI file image behind -kbdin.  This is a midiin device under another
+// type so that the ACIA's port keeps the option name -midiin instead of
+// both being numbered.
+class mirage_kbdin_device : public midiin_device
+{
+public:
+	mirage_kbdin_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0);
+
+	virtual std::pair<std::error_condition, std::string> call_load() override;
+
+	virtual const char *image_type_name() const noexcept override { return "kbdin"; }
+	virtual const char *image_brief_type_name() const noexcept override { return "kbd"; }
+};
+
+DEFINE_DEVICE_TYPE_PRIVATE(MIRAGE_KBDIN, mirage_kbdin_device, mirage_kbdin_device, "mirage_kbdin", "Mirage keyboard MIDI file input")
+
+class mirage_keyboard_device : public device_t, public device_serial_interface
+{
+public:
+	mirage_keyboard_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0);
+
+	auto sclk_handler() { return m_sclk_cb.bind(); }    // -> VIA CB1
+	auto sdata_handler() { return m_sdata_cb.bind(); }  // -> VIA CB2
+	void sack_w(int state);                              // <- VIA CA2
+
+	// Protocol timing in microseconds (assumed, see above)
+	static constexpr int BIT_HALF_PERIOD_US = 5;
+	static constexpr int SACK_LATENCY_US    = 50;
+
+protected:
+	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD;
+	virtual void device_start() override ATTR_COLD;
+	virtual void device_reset() override ATTR_COLD;
+
+	// device_serial_interface implementation (MIDI bytes arrive at 31250 8-N-1)
+	virtual void rcv_complete() override;
+
+private:
+	enum : uint8_t { IDLE, LATENCY, CLK_LOW, CLK_HIGH };
+
+	TIMER_CALLBACK_MEMBER(shift_tick);
+	void midi_byte(uint8_t data);
+	void midi_message();
+	void enqueue(uint8_t data);
+	void arm_if_ready();
+	void build_velocity_inverse();
+	uint8_t velocity_to_raw(uint8_t vel, bool release) const;
+
+	required_device<midiin_device> m_midi;
+	devcb_write_line m_sclk_cb;
+	devcb_write_line m_sdata_cb;
+	emu_timer *m_timer;
+
+	// bytes waiting for the link, oldest first
+	uint8_t m_ring[256];
+	uint8_t m_rd, m_wr;
+
+	// the shifter
+	uint8_t m_phase;
+	uint8_t m_byte;
+	uint8_t m_bit;
+	bool m_armed;      // a /SACK pulse has been seen since the last byte
+	int m_sack;        // the CA2 line as last driven
+
+	// the MIDI parser
+	uint8_t m_status;
+	uint8_t m_data[2];
+	uint8_t m_ndata;
+	bool m_pedal;
+
+	// raw timing byte for each MIDI velocity, from the ROM curve
+	uint8_t m_raw_attack[128];
+	uint8_t m_raw_release[128];
+};
+
+DEFINE_DEVICE_TYPE_PRIVATE(MIRAGE_KEYBOARD, mirage_keyboard_device, mirage_keyboard_device, "mirage_kbd", "Mirage keyboard controller (R6500/11 protocol)")
+
+mirage_kbdin_device::mirage_kbdin_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
+	: midiin_device(mconfig, MIRAGE_KBDIN, tag, owner, clock)
+{
+}
+
+std::pair<std::error_condition, std::string> mirage_kbdin_device::call_load()
+{
+	// the keyboard device needs the boot ROM's velocity curves, so do not accept input without them
+	memory_region *rom = machine().root_device().memregion("osrom");
+	for (const auto &c : VELOCITY_CURVES)
+	{
+		if (!velocity_curve_length(rom, c.offset))
+		{
+			return std::make_pair(
+					image_error::INVALIDIMAGE,
+					util::string_format("The boot ROM has no %s velocity curve at $%04x, which the keyboard input needs", c.name, 0xf000 + c.offset));
+		}
+	}
+
+	return midiin_device::call_load();
+}
+
+mirage_keyboard_device::mirage_keyboard_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
+	: device_t(mconfig, MIRAGE_KEYBOARD, tag, owner, clock)
+	, device_serial_interface(mconfig, *this)
+	, m_midi(*this, "midi")
+	, m_sclk_cb(*this)
+	, m_sdata_cb(*this)
+	, m_timer(nullptr)
+	, m_rd(0), m_wr(0)
+	, m_phase(IDLE), m_byte(0), m_bit(0), m_armed(false), m_sack(1)
+	, m_status(0), m_ndata(0), m_pedal(false)
+{
+}
+
+void mirage_keyboard_device::device_add_mconfig(machine_config &config)
+{
+	MIRAGE_KBDIN(config, m_midi, 0);
+	m_midi->input_callback().set(FUNC(mirage_keyboard_device::rx_w));
+}
+
+void mirage_keyboard_device::device_start()
+{
+	m_timer = timer_alloc(FUNC(mirage_keyboard_device::shift_tick), this);
+	build_velocity_inverse();
+
+	save_item(NAME(m_ring));
+	save_item(NAME(m_rd));
+	save_item(NAME(m_wr));
+	save_item(NAME(m_phase));
+	save_item(NAME(m_byte));
+	save_item(NAME(m_bit));
+	save_item(NAME(m_armed));
+	save_item(NAME(m_sack));
+	save_item(NAME(m_status));
+	save_item(NAME(m_data));
+	save_item(NAME(m_ndata));
+	save_item(NAME(m_pedal));
+}
+
+void mirage_keyboard_device::device_reset()
+{
+	// we only receive: MIDI is 31250 8-N-1
+	set_data_frame(1, 8, PARITY_NONE, STOP_BITS_1);
+	set_rcv_rate(31250);
+	set_tra_rate(0);
+	receive_register_reset();
+
+	m_rd = m_wr = 0;
+	m_phase = IDLE;
+	m_armed = false;
+	m_status = 0;
+	m_ndata = 0;
+	m_pedal = false;
+	m_timer->adjust(attotime::never);
+
+	// idle: clock high, data high.  The 6522 shifts in on the rising CB1 edge
+	// and counts edges from the SR read, so the clock must rest high.
+	m_sclk_cb(1);
+	m_sdata_cb(1);
+}
+
+// Invert the boot ROM's velocity curves.  For each MIDI velocity the nearest
+// curve value wins, which is the best any keyboard can do: with the default
+// sensitivity the OS passes on exactly curve[raw].  If a curve is missing the
+// table is left empty; that cannot matter, because mirage_kbdin_device
+// refused its image and nothing is sent to this device.
+void mirage_keyboard_device::build_velocity_inverse()
+{
+	std::fill(std::begin(m_raw_attack), std::end(m_raw_attack), 0);
+	std::fill(std::begin(m_raw_release), std::end(m_raw_release), 0);
+
+	memory_region *rom = machine().root_device().memregion("osrom");
+	uint8_t *const outputs[2] = { m_raw_attack, m_raw_release };
+	for (int i = 0; i < 2; i++)
+	{
+		const velocity_curve &c = VELOCITY_CURVES[i];
+		const unsigned len = velocity_curve_length(rom, c.offset);
+		if (!len)
+		{
+			LOGKBD("%s: no %s curve in the boot ROM\n", tag(), c.name);
+			continue;
+		}
+
+		const uint8_t *curve = rom->base() + c.offset;
+		LOGKBD("%s: %s curve at ROM $%04x, %u monotonic entries, %02x..%02x\n",
+				tag(), c.name, 0xf000 + c.offset, len, curve[0], curve[len - 1]);
+		for (unsigned vel = 0; vel < 128; vel++)
+		{
+			unsigned want = vel ? vel : 1;
+			unsigned best = 0, bestdist = 0x100;
+			for (unsigned r = 0; r < len; r++)
+			{
+				unsigned dist = (curve[r] > want) ? (curve[r] - want) : (want - curve[r]);
+				if (dist < bestdist) { bestdist = dist; best = r; }
+			}
+			outputs[i][vel] = uint8_t(best);
+		}
+	}
+}
+
+uint8_t mirage_keyboard_device::velocity_to_raw(uint8_t vel, bool release) const
+{
+	return release ? m_raw_release[vel & 0x7f] : m_raw_attack[vel & 0x7f];
+}
+
+// --- the serial link to the VIA ---
+
+void mirage_keyboard_device::sack_w(int state)
+{
+	if (state == m_sack)
+		return;
+	m_sack = state;
+	if (!state)
+	{
+		// the OS pulses CA2 low then high after each byte.  The low edge is
+		// the acknowledge; the next byte may go.
+		LOGKBD("%s: /SACK pulse\n", tag());
+		m_armed = true;
+		arm_if_ready();
+	}
+}
+
+void mirage_keyboard_device::enqueue(uint8_t data)
+{
+	if (uint8_t(m_wr + 1) == m_rd)
+	{
+		logerror("%s: keyboard queue full, byte $%02x dropped\n", tag(), data);
+		return;
+	}
+	m_ring[m_wr++] = data;
+	arm_if_ready();
+}
+
+void mirage_keyboard_device::arm_if_ready()
+{
+	if (m_phase != IDLE || !m_armed || m_rd == m_wr)
+		return;
+	m_phase = LATENCY;
+	m_timer->adjust(attotime::from_usec(SACK_LATENCY_US));
+}
+
+TIMER_CALLBACK_MEMBER(mirage_keyboard_device::shift_tick)
+{
+	switch (m_phase)
+	{
+	case LATENCY:
+		// start the byte: MSB first, data set up before the clock falls
+		m_byte = m_ring[m_rd++];
+		m_armed = false;
+		m_bit = 8;
+		LOGKBD("%s: shifting $%02x\n", tag(), m_byte);
+		[[fallthrough]];
+
+	case CLK_HIGH:
+		if (m_bit == 0)
+		{
+			// byte complete; wait for the OS to acknowledge it
+			m_phase = IDLE;
+			arm_if_ready();
+			return;
+		}
+		m_bit--;
+		m_sdata_cb(BIT(m_byte, m_bit));
+		m_sclk_cb(0);
+		m_phase = CLK_LOW;
+		m_timer->adjust(attotime::from_usec(BIT_HALF_PERIOD_US));
+		return;
+
+	case CLK_LOW:
+		// the rising edge is where the 6522 samples SDATA
+		m_sclk_cb(1);
+		m_phase = CLK_HIGH;
+		m_timer->adjust(attotime::from_usec(BIT_HALF_PERIOD_US));
+		return;
+
+	default:
+		m_phase = IDLE;
+		return;
+	}
+}
+
+// --- MIDI in -> keyboard events ---
+
+void mirage_keyboard_device::rcv_complete()
+{
+	receive_register_extract();
+	midi_byte(get_received_char());
+}
+
+void mirage_keyboard_device::midi_byte(uint8_t data)
+{
+	if (data >= 0xf8)
+		return;                          // real-time: nothing a keyboard does
+	if (data >= 0xf0)
+	{
+		m_status = 0;                    // system common cancels running status
+		m_ndata = 0;
+		return;
+	}
+	if (data & 0x80)
+	{
+		m_status = data;
+		m_ndata = 0;
+		return;
+	}
+	if (!m_status)
+		return;                          // data with no status: ignore
+	m_data[m_ndata++] = data;
+	const unsigned need = ((m_status & 0xf0) == 0xc0 || (m_status & 0xf0) == 0xd0) ? 1 : 2;
+	if (m_ndata >= need)
+	{
+		midi_message();
+		m_ndata = 0;                     // running status stays in force
+	}
+}
+
+void mirage_keyboard_device::midi_message()
+{
+	const uint8_t kind = m_status & 0xf0;
+	if (kind == 0x90 || kind == 0x80)
+	{
+		const bool off = (kind == 0x80) || (m_data[1] == 0);
+		const int key = int(m_data[0]) - 0x24;   // the OS adds 0x24 back
+		if (key < 0 || key > 60)
+		{
+			LOGKBD("%s: MIDI note %d is off the 61-key keyboard, ignored\n", tag(), m_data[0]);
+			return;
+		}
+		const uint8_t raw = velocity_to_raw(m_data[1], off);
+		LOGKBD("%s: note %s key %d vel %d -> raw $%02x\n", tag(), off ? "off" : "on", key, m_data[1], raw);
+		enqueue(off ? 0x80 : 0x90);
+		enqueue(uint8_t(key));
+		enqueue(raw);
+	}
+	else if (kind == 0xb0 && m_data[0] == 64)
+	{
+		const bool down = m_data[1] >= 64;
+		if (down != m_pedal)
+		{
+			m_pedal = down;
+			LOGKBD("%s: pedal %s\n", tag(), down ? "down" : "up");
+			enqueue(down ? 0xb8 : 0xb9);
+		}
+	}
+	// everything else (other controllers, program change, bend) has no
+	// keyboard controller equivalent; the wheels reach the OS through the ADC
+}
+
 
 class enmirage_state : public driver_device
 {
@@ -116,6 +558,7 @@ public:
 		, m_irq_merge(*this, "irqmerge")
 		, m_cassette(*this, "cassette")
 		, m_acia(*this, "acia6850")
+		, m_kbd(*this, "kbd")
 		, m_wheel(*this, {PITCH_TAG, MOD_TAG})
 		, m_key(*this, {"pb5", "pb6", "pb7"})
 	{
@@ -154,6 +597,7 @@ private:
 	required_device<input_merger_device> m_irq_merge;
 	required_device<cassette_image_device> m_cassette;
 	required_device<acia6850_device> m_acia;
+	required_device<mirage_keyboard_device> m_kbd;
 
 	required_ioport_array<2> m_wheel;
 	required_ioport_array<3> m_key;
@@ -385,6 +829,12 @@ void enmirage_state::mirage(machine_config &config)
 	m_via->readpb_handler().set(FUNC(enmirage_state::mirage_via_read_portb));
 	m_via->writepb_handler().set(FUNC(enmirage_state::mirage_via_write_portb));
 	m_via->irq_handler().set(m_irq_merge, FUNC(input_merger_device::in_w<0>));
+
+	// the keyboard controller stand-in on the VIA shift register
+	MIRAGE_KEYBOARD(config, m_kbd, 0);
+	m_kbd->sclk_handler().set(m_via, FUNC(via6522_device::write_cb1));
+	m_kbd->sdata_handler().set(m_via, FUNC(via6522_device::write_cb2));
+	m_via->ca2_handler().set(m_kbd, FUNC(mirage_keyboard_device::sack_w));
 
 	PWM_DISPLAY(config, m_display).set_size(2, 8);
 	config.set_default_layout(layout_enmirage);
