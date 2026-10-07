@@ -53,6 +53,8 @@ public:
 	virtual const char *image_brief_type_name() const noexcept override { return "min"; }
 
 protected:
+	midiin_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock);
+
 	// device_t implementation
 	virtual ioport_constructor device_input_ports() const override ATTR_COLD;
 	virtual void device_start() override ATTR_COLD;

@@ -51,7 +51,12 @@ INPUT_PORTS_END
 -------------------------------------------------*/
 
 midiin_device::midiin_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
-	: device_t(mconfig, MIDIIN, tag, owner, clock)
+	: midiin_device(mconfig, MIDIIN, tag, owner, clock)
+{
+}
+
+midiin_device::midiin_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock)
+	: device_t(mconfig, type, tag, owner, clock)
 	, device_image_interface(mconfig, *this)
 	, device_serial_interface(mconfig, *this)
 	, m_midi()
