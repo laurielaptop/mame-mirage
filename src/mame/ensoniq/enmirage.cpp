@@ -57,13 +57,15 @@
     provided that plays a MIDI file (-kbdin) into the shifter.
 
     Unimplemented:
-        * Four Pole Low-Pass Voltage Controlled Filter section
         * External sync signal
         * Foot pedal
         * ADC feedback
         * Piano keyboard controller (only the stand-in described above)
         * Expansion connector
         * Stereo output
+
+    Modelled approximately:
+        * The eight CEM3328 four-pole low-pass filters (see "CEM3328 filters" below).
 
 ***************************************************************************/
 
@@ -83,6 +85,10 @@
 #include "sound/es5503.h"
 #include "speaker.h"
 #include "video/pwm.h"
+
+#include <algorithm>
+#include <cmath>
+#include <numbers>
 
 #include "enmirage.lh"
 
@@ -543,6 +549,310 @@ void mirage_keyboard_device::midi_message()
 }
 
 
+/***************************************************************************
+    CEM3328 filters
+
+    The eight CEM3328 filters, one per voice, are the Mirage's entire analog
+    voice.  There is no VCA on the board and none inside the chip, so
+    amplitude is the DOC's own per-oscillator volume register, which
+    es5503.cpp already applies.  Without this device the DOC reaches the
+    speaker unfiltered.
+
+    The routing this hangs off exists on both sides.  The DOC presents a
+    channel address and a 1-of-8 analog switch feeds that channel's output to
+    the corresponding filter.  MAME's es5503 assigns each oscillator to
+    output channel (control >> 4) & (channels - 1) and this driver sets
+    eight channels, so the per-voice input is simply the eight stream
+    outputs.
+
+    What the model carries:
+
+    * Four poles at one frequency with resonance feedback, solved with zero
+      delay in the loop so that the oscillation threshold sits at exactly a
+      loop gain of 4 at every cutoff rather than drifting with sample rate.
+    * The datasheet's limiter, in the feedback path where the chip's block
+      diagram draws it, bounding self-oscillation instead of letting the
+      loop diverge.
+    * Sample-and-hold on both control voltages, with the settling of a
+      single DAC strobe: one write moves the hold capacitor 80-95% of the
+      way, so a cutoff step arrives over two or three control passes as it
+      does on the instrument.
+    * The 12dB passband drop at full resonance, which is what the Mirage
+      gets because the chip's resonance compensation is not used.
+
+    What it does not carry:
+
+    * The passive low-pass at the filter input.  It is a fixed pole well
+      above the audio band.
+    * Any per-chip spread.  The datasheet's initial frequency and resonance
+      spreads are what the boot ROM's calibration exists to trim.
+    * The chip's drift and temperature coefficient.
+
+    This is an approximation to save trips to the real instrument, not a
+    measurement of its tone.
+
+***************************************************************************/
+
+// ---- the CV path: DAC byte to the chip's frequency and resonance inputs ----
+
+// Full-scale voltage of the sample-and-holds, set by the DAC reference that
+// is derived from the regulated analog supply rails.  The exact reference is
+// not known, and it scales the whole cutoff range.  If measurements are
+// consistently sharp or flat, look at F_ZERO_CAP_SCALE first, which is known
+// to a component value, before this.
+constexpr double CV_V_SPAN = 5.0;
+
+// A resistor network between the sample-and-hold and the chip's frequency
+// control input divides the voltage by about 28 and adds an offset of about
+// -50mV.
+constexpr double CV_DIVIDER  = 28.0;
+constexpr double CV_OFFSET_V = -0.050;
+
+// A DAC write leaves the route to a hold capacitor open for the five or six
+// CPU cycles until the next write, which moves the capacitor 80-95% of the
+// way to the new value.  Set to 1.0 for an idealised model with instant CVs.
+constexpr double CV_SETTLE_K = 0.85;
+
+// ---- the chip, from the CEM3328 datasheet ----
+
+// Frequency control scale: 20mV per octave (typical) over a 14 octave range.
+constexpr double F_VOLTS_PER_OCTAVE = 0.020;
+
+// Initial frequency at zero control voltage: 350Hz (typical), specified with
+// 0.03uF pole capacitors.  The Mirage fits 0.033uF for the three main poles
+// and frequency goes as 1/C, so the board sits 0.030/0.033 below the
+// specified figure, about 0.14 octave.  Kept separate from CV_V_SPAN because
+// it is known to a component value and CV_V_SPAN is not.
+constexpr double F_ZERO_DATASHEET_HZ = 350.0;
+constexpr double F_ZERO_CAP_SCALE    = 0.030 / 0.033;
+constexpr double F_ZERO_HZ           = F_ZERO_DATASHEET_HZ * F_ZERO_CAP_SCALE;
+
+// This is the largest assumption in the model: F_ZERO_HZ is taken to be the
+// corner frequency of each individual pole, not the -3dB point of the four
+// together.  The datasheet only gives an initial frequency and specifies it in
+// terms of the pole capacitors, which is what sets a transconductor and
+// capacitor pole, so this is the physically motivated reading but it is a
+// reading.  A cascade of four equal poles is -3dB at 0.435 of the pole
+// corner, so the two readings differ by a fixed 1.20 octaves.  If the model
+// turns out to be uniformly 1.2 octaves out, this is the reason and
+// F_ZERO_HZ is where to fix it.
+
+// Resonance control voltage for oscillation: 3.2V (typical, 2.7V to 3.7V).
+// The resonance CV is the sample-and-hold output directly, so with a 5V span
+// that is DAC byte 3.2/5 * 255 = 163, and a four pole loop reaches its
+// oscillation gain at exactly 4, which fixes the mapping.
+constexpr double Q_OSC_BYTE = 163.0;
+
+// Passband gain change from zero to maximum resonance: -12dB, at a ratio of
+// resonance to signal input of zero, which is where the Mirage sits.  The
+// datasheet curve for this is plotted against that input ratio, which is a
+// circuit design choice rather than a played control, so it gives the
+// endpoint and nothing about the way there.  Linear in dB against the loop
+// gain is this model's own choice; if it sounds wrong the shape has to come
+// from measuring the instrument.
+constexpr double PASSBAND_DROP_DB = -12.0;
+
+// The limiter's bound.  The datasheet gives an oscillation output swing of
+// 2.3V peak to peak (typical) against a nominal output swing of 6.5V peak to
+// peak for 1% THD without resonance, so a self-oscillating chip settles about
+// 9dB below its own clean full output.  Taking full scale at this device's
+// input and output to be that 6.5V, the target is 2.3/6.5 of it.  Simulating
+// this loop at maximum resonance and solving for the bound that gives that
+// amplitude yields the value below.  It is linear in the bound, so it can be
+// re-derived in one step if the mapping changes.
+constexpr double Q_LIMIT = 0.10146;
+
+// es5503.cpp scales each of its eight channel outputs by 32768*8, reserving
+// headroom for all eight summing to full scale, so one voice at full DOC
+// volume arrives at 1/8.  Undo that on the way in so that a full-scale voice
+// means the chip's nominal 6.5V, which is what makes Q_LIMIT a datasheet
+// quantity, and put it back after the summer so that the overall level is
+// unchanged when the filters are wide open.
+constexpr double DOC_CHANNEL_HEADROOM = 8.0;
+constexpr double SUMMER_SCALE         = 1.0 / DOC_CHANNEL_HEADROOM;
+
+// At byte 255 the CV law asks for about 27kHz, which is past Nyquist at any
+// ordinary output rate and would send the bilinear prewarp through infinity.
+// Clamp it: the filter is wide open either way.
+constexpr double FC_MAX_FRACTION = 0.45;
+
+class mirage_filters_device : public device_t, public device_sound_interface
+{
+public:
+	mirage_filters_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0);
+
+	// A write anywhere in 0xe400-0xe41f: the data goes into the DAC and the
+	// address into the route latch.  Called from enmirage_state::coefficients_w.
+	void cv_w(offs_t offset, uint8_t data);
+
+protected:
+	virtual void device_start() override ATTR_COLD;
+	virtual void device_post_load() override;
+	virtual void sound_stream_update(sound_stream &stream) override;
+
+private:
+	void recalc(int ch);
+
+	sound_stream *m_stream = nullptr;
+	uint32_t m_rate = 0;
+
+	// Held state: the sixteen sample-and-holds and the DAC latch.  Kept in
+	// DAC byte units (0-255, fractional between strobes) so that what is
+	// saved is what the hardware holds, and every coefficient below is
+	// derived from it.
+	double m_vf[8]{};
+	double m_vq[8]{};
+	uint8_t m_dac = 0;
+
+	// Filter state: four pole outputs per voice.
+	double m_z[8][4]{};
+
+	// Derived from m_vf and m_vq by recalc(); not saved, rebuilt on load.
+	double m_g[8]{}, m_g2[8]{}, m_g3[8]{}, m_g4[8]{};
+	double m_r[8]{}, m_gain[8]{};
+};
+
+DEFINE_DEVICE_TYPE_PRIVATE(MIRAGE_FILTERS, mirage_filters_device, mirage_filters_device, "mirage_filters", "Mirage CEM3328 filters")
+
+mirage_filters_device::mirage_filters_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
+	: device_t(mconfig, MIRAGE_FILTERS, tag, owner, clock)
+	, device_sound_interface(mconfig, *this)
+{
+}
+
+void mirage_filters_device::device_start()
+{
+	// Eight in, one out: the Mirage is mono, and the eight filter outputs are
+	// summed through equal resistors.  Run at whatever the machine's output
+	// rate is and let the framework resample the DOC's output into it.
+	m_stream = stream_alloc(8, 1, SAMPLE_RATE_OUTPUT_ADAPTIVE);
+
+	save_item(NAME(m_vf));
+	save_item(NAME(m_vq));
+	save_item(NAME(m_dac));
+	save_item(NAME(m_z));
+
+	// m_rate = 0 forces the first sound_stream_update to build coefficients.
+}
+
+void mirage_filters_device::device_post_load()
+{
+	for (int ch = 0; ch < 8; ch++)
+		recalc(ch);
+}
+
+// The CV law, and the bilinear coefficients for one voice.  Called on every
+// routed DAC write and whenever the output rate changes under us.
+void mirage_filters_device::recalc(int ch)
+{
+	if (m_rate == 0)
+		return;
+
+	const double vc = (m_vf[ch] / 255.0) * CV_V_SPAN / CV_DIVIDER + CV_OFFSET_V;
+	double fc = F_ZERO_HZ * pow(2.0, vc / F_VOLTS_PER_OCTAVE);
+	fc = std::clamp(fc, 1.0, FC_MAX_FRACTION * m_rate);
+
+	// Topology-preserving one-pole: G is the prewarped integrator gain, g the
+	// coefficient of a single stage.  Four identical stages.
+	const double G = tan(std::numbers::pi * fc / m_rate);
+	const double g = G / (1.0 + G);
+	m_g[ch]  = g;
+	m_g2[ch] = g * g;
+	m_g3[ch] = m_g2[ch] * g;
+	m_g4[ch] = m_g3[ch] * g;
+
+	// Loop gain.  4 is the four pole oscillation threshold, and Q_OSC_BYTE is
+	// the DAC byte the datasheet puts it at, so the two ends agree by
+	// construction and the byte scale between them is linear, as the
+	// resonance CV is.
+	m_r[ch] = 4.0 * m_vq[ch] / Q_OSC_BYTE;
+
+	// The loop's own passband droop is 1/(1+r); undo it, then apply the
+	// datasheet's drop.  Doing it in that order is what makes the -12dB figure
+	// mean what the datasheet means by it rather than compounding with the
+	// topology's own loss.  (As a check on the model, 1/(1+r) at r = 4 is
+	// -14dB, so the shape the unmodified chip gets for free and the datasheet
+	// number agree to about 2dB.)
+	const double rq = std::min(m_r[ch], 4.0);
+	m_gain[ch] = (1.0 + m_r[ch]) * pow(10.0, PASSBAND_DROP_DB / 20.0 * rq / 4.0);
+}
+
+// Address bit 3 inhibits the cutoff selector and bit 4 the resonance
+// selector, so a write with neither set reaches both.
+void mirage_filters_device::cv_w(offs_t offset, uint8_t data)
+{
+	m_stream->update();
+
+	m_dac = data;
+	const int ch = offset & 7;
+	const int fs = (offset >> 3) & 3;
+
+	// Each strobe closes most, not all, of the gap: the hold capacitor
+	// charges through the selector's on-resistance for the few microseconds
+	// the route stays open.  Repeated control passes converge geometrically.
+	if (fs == 0 || fs == 2)                     // 0xe400 / 0xe410: cutoff
+		m_vf[ch] += CV_SETTLE_K * (double(m_dac) - m_vf[ch]);
+	if (fs == 0 || fs == 1)                     // 0xe400 / 0xe408: resonance
+		m_vq[ch] += CV_SETTLE_K * (double(m_dac) - m_vq[ch]);
+
+	if (fs != 3)                                // 0xe418: preload, routed nowhere
+		recalc(ch);
+}
+
+void mirage_filters_device::sound_stream_update(sound_stream &stream)
+{
+	if (stream.sample_rate() != m_rate)
+	{
+		m_rate = stream.sample_rate();
+		for (int ch = 0; ch < 8; ch++)
+			recalc(ch);
+	}
+
+	for (int i = 0; i < stream.samples(); i++)
+	{
+		double sum = 0.0;
+
+		for (int ch = 0; ch < 8; ch++)
+		{
+			const double g = m_g[ch], g4 = m_g4[ch], r = m_r[ch];
+			double *z = m_z[ch];
+
+			const double x = double(stream.get(ch, i)) * DOC_CHANNEL_HEADROOM;
+
+			// What the four stages would put out on their stored state alone,
+			// with no input this sample.  Having it in closed form is what
+			// lets the feedback be solved rather than delayed by a sample.
+			const double s = (1.0 - g) * (m_g3[ch] * z[0] + m_g2[ch] * z[1] + g * z[2] + z[3]);
+
+			// Solve y = g^4 * (x - r * limit(y)) + s.  Below the limiter the
+			// loop is linear; above it the fed-back term is a constant, so
+			// both branches are exact and no iteration is needed.  Saturating
+			// only ever feeds back less, so a solution past the bound stays
+			// past it: the branch cannot disagree with itself.
+			double y = (g4 * x + s) / (1.0 + r * g4);
+			if (y > Q_LIMIT)
+				y = g4 * (x - r * Q_LIMIT) + s;
+			else if (y < -Q_LIMIT)
+				y = g4 * (x + r * Q_LIMIT) + s;
+
+			const double u = x - r * std::clamp(y, -Q_LIMIT, Q_LIMIT);
+
+			// Run the stages for real to carry the state forward.  The fourth
+			// output is the y solved above, by construction.
+			double v = (u - z[0]) * g;   const double y1 = v + z[0];  z[0] = y1 + v;
+			v = (y1 - z[1]) * g;         const double y2 = v + z[1];  z[1] = y2 + v;
+			v = (y2 - z[2]) * g;         const double y3 = v + z[2];  z[2] = y3 + v;
+			v = (y3 - z[3]) * g;         const double y4 = v + z[3];  z[3] = y4 + v;
+
+			sum += y4 * m_gain[ch];
+		}
+
+		// Clamp rather than put because eight resonant voices peaking together
+		// can exceed the summer's headroom, as they can on the board.
+		stream.put_clamp(0, i, sum * SUMMER_SCALE, 1.0);
+	}
+}
+
 class enmirage_state : public driver_device
 {
 public:
@@ -559,6 +869,7 @@ public:
 		, m_cassette(*this, "cassette")
 		, m_acia(*this, "acia6850")
 		, m_kbd(*this, "kbd")
+		, m_filters(*this, "filters")
 		, m_wheel(*this, {PITCH_TAG, MOD_TAG})
 		, m_key(*this, {"pb5", "pb6", "pb7"})
 	{
@@ -598,6 +909,7 @@ private:
 	required_device<cassette_image_device> m_cassette;
 	required_device<acia6850_device> m_acia;
 	required_device<mirage_keyboard_device> m_kbd;
+	required_device<mirage_filters_device> m_filters;
 
 	required_ioport_array<2> m_wheel;
 	required_ioport_array<3> m_key;
@@ -690,6 +1002,9 @@ void enmirage_state::coefficients_w(offs_t offset, uint8_t data)
 				(filter_input & 0x03) == 0 ? " and " : "",
 				(filter_input & 0x02) == 0 ? "VQ" : "", /* filter resonance */
 				(filter_input & 0x03) == 0x03 ? "preload dac" : "");
+
+	// one DAC with a latched route, so the filters decode the raw offset
+	m_filters->cv_w(offset, data);
 }
 
 // port A:
@@ -813,7 +1128,12 @@ void enmirage_state::mirage(machine_config &config)
 	es5503.set_addrmap(0, &enmirage_state::enmirage_es5503_map);
 	es5503.irq_func().set(m_irq_merge, FUNC(input_merger_device::in_w<2>));
 	es5503.adc_func().set(FUNC(enmirage_state::mirage_adc_read));
-	es5503.add_route(ALL_OUTPUTS, "speaker", 1.0);
+
+	// the DOC's channel n output is the input of the filter for voice n
+	MIRAGE_FILTERS(config, m_filters);
+	for (int i = 0; i < 8; i++)
+		es5503.add_route(i, m_filters, 1.0, i);
+	m_filters->add_route(0, "speaker", 1.0);
 
 	// The VIA runs at 2 MHz, which is not E.  The OS generates the ACIA's
 	// 500 kHz clock (31250 baud with the divide-by-16 mode) on PB7 using a timer
