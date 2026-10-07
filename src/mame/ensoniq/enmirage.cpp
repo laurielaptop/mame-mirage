@@ -21,9 +21,14 @@
         e100-e101: 6850 UART (for MIDI)
         e200-e2ff: 6522 VIA
         e400-e407: write to both filters
-        e408-e40f: filter cut-off frequency
-        e410-e417: filter resonance
+        e408-e40f: filter resonance
+        e410-e417: filter cut-off frequency
         e418-e41f: DAC pre-set
+        (One DAC serves all the filter control voltages.  Each write loads the data
+        into the DAC and latches the low address bits, which keep selecting the
+        destination until the next write.  Address bit 3 inhibits the cut-off
+        selector and bit 4 the resonance selector, so with neither set both are
+        written, and with both set only the DAC is loaded.)
         e800-e803: WD1770 FDC
         ec00-ecef: ES5503 "DOC" sound chip
         f000-ffff: boot ROM
