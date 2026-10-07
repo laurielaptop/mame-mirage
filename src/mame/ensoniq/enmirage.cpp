@@ -59,13 +59,16 @@
     Unimplemented:
         * External sync signal
         * Foot pedal
-        * ADC feedback
         * Piano keyboard controller (only the stand-in described above)
         * Expansion connector
         * Stereo output
 
     Modelled approximately:
         * The eight CEM3328 four-pole low-pass filters (see "CEM3328 filters" below).
+        * The DOC's ADC feedback: mux inputs 0 and 1 (the compressed and the line level
+          mixed input) read the summed output of those filters, which is what the boot
+          ROM's filter auto-tune measures (see "ADC feedback" below).  The compander in
+          front of input 0 is not modelled, so the two read alike.
 
 ***************************************************************************/
 
@@ -579,6 +582,9 @@ void mirage_keyboard_device::midi_message()
       does on the instrument.
     * The 12dB passband drop at full resonance, which is what the Mirage
       gets because the chip's resonance compensation is not used.
+    * The chip's output noise, at the datasheet figure.  Without something to
+      amplify, a digital model of a marginally unstable loop sits at exactly
+      zero forever and never oscillates.
 
     What it does not carry:
 
@@ -586,7 +592,8 @@ void mirage_keyboard_device::midi_message()
       above the audio band.
     * Any per-chip spread.  The datasheet's initial frequency and resonance
       spreads are what the boot ROM's calibration exists to trim.
-    * The chip's drift and temperature coefficient.
+    * The chip's drift and temperature coefficient.  (Its noise is modelled,
+      see NOISE_RMS_VOLTS.)
 
     This is an approximation to save trips to the real instrument, not a
     measurement of its tone.
@@ -671,10 +678,63 @@ constexpr double Q_LIMIT = 0.10146;
 constexpr double DOC_CHANNEL_HEADROOM = 8.0;
 constexpr double SUMMER_SCALE         = 1.0 / DOC_CHANNEL_HEADROOM;
 
+// The consequence of that choice, stated once: 1.0 peak in this device is
+// half of 6.5V peak to peak.
+constexpr double VOLTS_PER_UNIT = 6.5 / 2.0;
+
+// Output noise with the filter wide open: 200uV r.m.s. (a datasheet maximum;
+// there is no typical figure).  This is not decoration: the boot ROM's filter
+// auto-tune measures a self-oscillation, and a zero-delay resonance loop
+// driven by exactly 0.0 stays at exactly 0.0 however far past its threshold
+// the gain is pushed.  A real chip oscillates because it has noise to
+// amplify.  The noise is injected at the input, inside the resonance loop, so
+// it is shaped by the four poles and grows at the loop's own rate.
+//
+// It is about 144dB below full scale, three orders of magnitude under a
+// 16-bit LSB, so it cannot reach a recording.  What it does is take about
+// fourteen cycles of oscillation to seed the loop up to the limiter, which is
+// 23ms at the frequency the ROM tunes to.  Set to 0.0 to remove it, at the
+// cost of a calibration that can only time out.
+constexpr double NOISE_RMS_VOLTS = 200e-6;
+constexpr double NOISE_RMS_UNITS = NOISE_RMS_VOLTS / VOLTS_PER_UNIT;
+
 // At byte 255 the CV law asks for about 27kHz, which is past Nyquist at any
 // ordinary output rate and would send the bilinear prewarp through infinity.
 // Clamp it: the filter is wide open either way.
 constexpr double FC_MAX_FRACTION = 0.45;
+
+// ---- ADC feedback ----
+//
+// The DOC's own 8-bit converter (register 0xe2) reads the machine's analog
+// output back.  Mux input 0 is the compressed and mixed node, the eight filter
+// outputs summed and passed through a compander, and input 1 is the same node
+// at line level.  The driver used to answer input 0 from a canned 34 byte
+// waveform whose only job was to get the boot ROM's filter auto-tune out of
+// the way.
+//
+// That auto-tune (ROM 0xf571, run for each of the eight voices) is the reason
+// the feedback has to be real.  For each channel it sets the resonance to 0xff
+// so that the filter oscillates, then polls the converter in a tight loop,
+// roughly one read every 50 CPU cycles or 20kHz, counting reads between a rise
+// past 0x90 and a fall to 0x70 or below.  It does four such cycles per trial.
+// If the count is too low it lowers the cutoff CV and if too high it raises
+// it, until the count lands in 129 to 132.  The cutoff byte that achieves
+// that, less a nominal 0x7a, is the voice's calibration offset, which the OS
+// adds to every cutoff CV afterwards.
+//
+// So the ROM is asking this model one question, at what CV does this chip
+// oscillate at about 610Hz, and the answer is a measurement of the CV law
+// above against the instrument's own calibration target.
+//
+// The gain from a filter output to the converter's input is not known, nor is
+// the compander's law or the converter's reference, so the scale below is a
+// choice: one voice at the CEM3328's nominal full swing (1.0 in this model,
+// 6.5V peak to peak) reads as the converter's full scale, with silence at
+// mid-scale.  What that buys is margin, which is all the ROM needs: a
+// self-oscillating voice settles at about 2.26V peak to peak, which codes as
+// +/-44 counts about 0x80, where the ROM's thresholds are +/-16.
+constexpr double  ADC_UNITS_FULL_SCALE = 1.0;
+constexpr uint8_t ADC_MID_SCALE        = 0x80;
 
 class mirage_filters_device : public device_t, public device_sound_interface
 {
@@ -685,6 +745,14 @@ public:
 	// address into the route latch.  Called from enmirage_state::coefficients_w.
 	void cv_w(offs_t offset, uint8_t data);
 
+	// The summer's output as the DOC's 8-bit converter codes it.  Brings the
+	// stream up to the current instant first: the ROM's calibration reads this
+	// far faster than the stream is generated, and a stale sample would make it
+	// measure the emulator's buffering.  aux is whatever else is mixed into
+	// that node (the audio input, which this driver stands in for with the
+	// cassette), in the same units.
+	uint8_t last_output(double aux = 0.0);
+
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_post_load() override;
@@ -692,6 +760,7 @@ protected:
 
 private:
 	void recalc(int ch);
+	double noise();
 
 	sound_stream *m_stream = nullptr;
 	uint32_t m_rate = 0;
@@ -707,9 +776,20 @@ private:
 	// Filter state: four pole outputs per voice.
 	double m_z[8][4]{};
 
+	// The last sample the summer produced, in the same units as the filter
+	// outputs and before SUMMER_SCALE, which is a headroom convention of this
+	// model and not a divider on the board.  Taking it from this side is what
+	// makes ADC_UNITS_FULL_SCALE a datasheet quantity.
+	double m_last_sum = 0.0;
+
 	// Derived from m_vf and m_vq by recalc(); not saved, rebuilt on load.
 	double m_g[8]{}, m_g2[8]{}, m_g3[8]{}, m_g4[8]{};
 	double m_r[8]{}, m_gain[8]{};
+
+	// Noise generator state.  A fixed seed and a xorshift rather than the
+	// machine's RNG, so that two runs of the same experiment record the same
+	// output.
+	uint32_t m_noise = 0x13579bdfU;
 };
 
 DEFINE_DEVICE_TYPE_PRIVATE(MIRAGE_FILTERS, mirage_filters_device, mirage_filters_device, "mirage_filters", "Mirage CEM3328 filters")
@@ -731,6 +811,8 @@ void mirage_filters_device::device_start()
 	save_item(NAME(m_vq));
 	save_item(NAME(m_dac));
 	save_item(NAME(m_z));
+	save_item(NAME(m_last_sum));
+	save_item(NAME(m_noise));
 
 	// m_rate = 0 forces the first sound_stream_update to build coefficients.
 }
@@ -739,6 +821,16 @@ void mirage_filters_device::device_post_load()
 {
 	for (int ch = 0; ch < 8; ch++)
 		recalc(ch);
+}
+
+// One white sample, uniform, at NOISE_RMS_UNITS r.m.s. (uniform on [-a, a) has
+// an r.m.s. of a/sqrt(3), hence the factor).
+double mirage_filters_device::noise()
+{
+	m_noise ^= m_noise << 13;
+	m_noise ^= m_noise >> 17;
+	m_noise ^= m_noise << 5;
+	return double(int32_t(m_noise)) / 2147483648.0 * NOISE_RMS_UNITS * 1.7320508075688772;
 }
 
 // The CV law, and the bilinear coefficients for one voice.  Called on every
@@ -817,7 +909,7 @@ void mirage_filters_device::sound_stream_update(sound_stream &stream)
 			const double g = m_g[ch], g4 = m_g4[ch], r = m_r[ch];
 			double *z = m_z[ch];
 
-			const double x = double(stream.get(ch, i)) * DOC_CHANNEL_HEADROOM;
+			const double x = double(stream.get(ch, i)) * DOC_CHANNEL_HEADROOM + noise();
 
 			// What the four stages would put out on their stored state alone,
 			// with no input this sample.  Having it in closed form is what
@@ -849,8 +941,18 @@ void mirage_filters_device::sound_stream_update(sound_stream &stream)
 
 		// Clamp rather than put because eight resonant voices peaking together
 		// can exceed the summer's headroom, as they can on the board.
+		m_last_sum = sum;
 		stream.put_clamp(0, i, sum * SUMMER_SCALE, 1.0);
 	}
+}
+
+uint8_t mirage_filters_device::last_output(double aux)
+{
+	m_stream->update();
+
+	const double code = double(ADC_MID_SCALE)
+			+ (m_last_sum + aux) / ADC_UNITS_FULL_SCALE * double(ADC_MID_SCALE);
+	return uint8_t(std::clamp(code, 0.0, 255.0));
 }
 
 class enmirage_state : public driver_device
@@ -916,10 +1018,6 @@ private:
 
 	int m_mux_value;
 	int m_key_col_select;
-
-	/* temporary audio data -- used to get past startup filter calibration -- remove when filters are implemented */
-	const uint8_t m_wave[34] = {0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x91, 0x69};
-	int m_wave_index;
 };
 
 void enmirage_state::floppy_formats(format_registration &fr)
@@ -939,13 +1037,13 @@ uint8_t enmirage_state::mirage_adc_read()
 	switch(m_mux_value & 0x03)
 	{
 		case 0:
-//          value = m_cassette->input(); /* compressed and mixed input: audio in and ES 5503 (TODO) */
-			value = m_wave[m_wave_index]; /* fake data to get past filter calibration (remove when filter implemented) */
+			/* compressed and mixed input: audio in and the ES5503 through the eight filters.
+			   The compander is not modelled, so this and case 1 read alike. */
+			value = m_filters->last_output(m_cassette->input());
 			LOGADCREAD("%s, 5503 sample: channel: compressed input, data: $%02x\n", machine().describe_context(), value);
-			if(++m_wave_index == 34) m_wave_index = 0;
 			break;
 		case 1:
-			value = m_cassette->input(); /* line level and mixed input: audio in and ES 5503 (TODO) */
+			value = m_filters->last_output(m_cassette->input()); /* line level and mixed input: audio in and ES 5503 */
 			LOGADCREAD("%s, 5503 sample: channel: line input, data: $%02x\n", machine().describe_context(), value);
 			break;
 		case 2:
@@ -965,7 +1063,6 @@ void enmirage_state::machine_start()
 {
 	save_item(NAME(m_mux_value));
 	save_item(NAME(m_key_col_select));
-	save_item(NAME(m_wave_index));
 	m_sample_bank->configure_entries(0, 4, m_sample_ram, 0x8000);
 }
 
@@ -973,7 +1070,6 @@ void enmirage_state::machine_reset()
 {
 	m_sample_bank->set_entry(0);
 	m_mux_value = 0;
-	m_wave_index = 0;
 }
 
 void enmirage_state::mirage_map(address_map &map)
