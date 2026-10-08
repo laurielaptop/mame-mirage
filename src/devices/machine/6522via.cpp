@@ -647,7 +647,9 @@ TIMER_CALLBACK_MEMBER(via6522_device::t1_tick)
 	// PB7 toggles on timeout in one-shot mode too, only while PB7 output is enabled
 	if (T1_CONTINUOUS(m_acr))
 	{
-		if (TIMER1_VALUE > 0 && T1_SET_PB7(m_acr))
+		// The period is two clocks with a zero latch, but PB7 stays put unless the driver
+		// asks for it to toggle: the Victor 9000 writes zero to silence its codec clock.
+		if ((TIMER1_VALUE > 0 || m_t1_zero_latch_toggles_pb7) && T1_SET_PB7(m_acr))
 			m_t1_pb7 = !m_t1_pb7;
 		m_t1->adjust(clocks_to_attotime(TIMER1_VALUE + 2));
 	}
