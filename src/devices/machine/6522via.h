@@ -84,6 +84,10 @@ public:
 	auto cb2_handler() { return m_cb2_handler.bind(); }
 	auto irq_handler() { return m_irq_handler.bind(); }
 
+	// A free-running timer 1 with a zero latch does not toggle PB7 unless this is
+	// set; machines whose software generates a clock on PB7 that way need it.
+	void set_t1_zero_latch_toggles_pb7(bool toggles) { m_t1_zero_latch_toggles_pb7 = toggles; }
+
 	void map(address_map &map) ATTR_COLD;
 
 	u8 read(offs_t offset);
@@ -175,6 +179,8 @@ private:
 	devcb_write_line m_cb1_handler;
 	devcb_write_line m_cb2_handler;
 	devcb_write_line m_irq_handler;
+
+	bool m_t1_zero_latch_toggles_pb7 = false;
 
 	uint8_t m_in_a;
 	int m_in_ca1;
