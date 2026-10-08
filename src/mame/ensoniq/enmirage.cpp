@@ -366,7 +366,13 @@ void enmirage_state::mirage(machine_config &config)
 	es5503.adc_func().set(FUNC(enmirage_state::mirage_adc_read));
 	es5503.add_route(ALL_OUTPUTS, "speaker", 1.0);
 
-	MOS6522(config, m_via, 3000000);
+	// The VIA runs at 2 MHz, which is not E.  The OS generates the ACIA's
+	// 500 kHz clock (31250 baud with the divide-by-16 mode) on PB7 using a timer
+	// 1 latch of zero, a PB7 period of four VIA clocks.  The VIA's phi2 input is
+	// wired to the DRAM /CAS strobe rather than E, and /CAS strobes once for
+	// each of the two bus masters (the CPU and the DOC) in every system clock
+	// period, so it runs at twice E.
+	MOS6522(config, m_via, 2000000);
 	m_via->writepa_handler().set(FUNC(enmirage_state::mirage_via_write_porta));
 	m_via->readpb_handler().set(FUNC(enmirage_state::mirage_via_read_portb));
 	m_via->writepb_handler().set(FUNC(enmirage_state::mirage_via_write_portb));
