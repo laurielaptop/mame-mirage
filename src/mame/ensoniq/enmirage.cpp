@@ -378,6 +378,9 @@ void enmirage_state::mirage(machine_config &config)
 	// each of the two bus masters (the CPU and the DOC) in every system clock
 	// period, so it runs at twice E.
 	MOS6522(config, m_via, 2000000);
+	// The OS clocks the ACIA from PB7 (see above), which only toggles for a zero timer 1
+	// latch if the VIA is told to.
+	m_via->set_t1_zero_latch_toggles_pb7(true);
 	m_via->writepa_handler().set(FUNC(enmirage_state::mirage_via_write_porta));
 	m_via->readpb_handler().set(FUNC(enmirage_state::mirage_via_read_portb));
 	m_via->writepb_handler().set(FUNC(enmirage_state::mirage_via_write_portb));
