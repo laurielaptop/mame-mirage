@@ -1,5 +1,5 @@
 // license:BSD-3-Clause
-// copyright-holders:R. Belmont, tim lindner
+// copyright-holders:R. Belmont, tim lindner, Laurie Laptop
 /***************************************************************************
 
     drivers/enmirage.c
