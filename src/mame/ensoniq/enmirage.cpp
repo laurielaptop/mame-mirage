@@ -307,7 +307,7 @@ void enmirage_state::mirage_via_write_porta(uint8_t data)
 
 // port B:
 //  bit 7: OUT UART clock
-//  bit 4: OUT disk select, motor on, and 6500/11 reset
+//  bit 4: OUT disk select, motor on (it does not reset the keyboard controller)
 //  bit 3: OUT sample/play
 //  bit 2: OUT mic line/in
 //  bit 1: OUT upper/lower bank (64k halves)
@@ -326,7 +326,7 @@ void enmirage_state::mirage_via_write_portb(uint8_t data)
 	if (floppy)
 		floppy->mon_w(data & 0x10 ? 1 : 0);
 
-	// handle 6500/11 reset (TODO)
+	// The keyboard controller's reset comes from the board's power-on reset circuit, not from this port.
 
 	// record audio input mixer position
 	m_mux_value = (data >> 2) & 0x03;
