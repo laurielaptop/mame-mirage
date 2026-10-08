@@ -340,7 +340,11 @@ void enmirage_state::enmirage_es5503_map(address_map &map)
 
 void enmirage_state::mirage(machine_config &config)
 {
-	MC6809E(config, m_maincpu, 2000000);
+	// The 6809E's E clock is 1 MHz.  The DOC's CLKIN is 8 MHz (half of the
+	// board's 16 MHz crystal) and the DOC divides that by eight to produce E,
+	// so the CPU is a genuine 6809E taking E as an input and cannot be running
+	// from its own oscillator.
+	MC6809E(config, m_maincpu, 1000000);
 	m_maincpu->set_addrmap(AS_PROGRAM, &enmirage_state::mirage_map);
 
 	INPUT_MERGER_ANY_HIGH(config, m_irq_merge).output_handler().set_inputline(m_maincpu, M6809_IRQ_LINE);
