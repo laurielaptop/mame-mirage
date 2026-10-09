@@ -1,3 +1,62 @@
+# Ensoniq Mirage emulator (MAME with an updated `enmirage` driver)
+
+This is a fork of [MAME](https://github.com/mamedev/mame) with changes to the Ensoniq Mirage driver. It is **not** the official MAME, it is not endorsed by the MAME team, and nothing here has been merged into MAME. Everything outside the files listed below is upstream MAME as of 2026-10-09 (commit 7804dd1c). MAME's own README follows after this section.
+
+**To run it you need a Mirage boot ROM image (`mirage.bin`, 4096 bytes). It is not included and not provided; use a dump of your own machine's ROM.**
+
+## What is different from MAME
+
+The branch `mirage` is MAME at that commit plus these changes to `src/mame/ensoniq/enmirage.cpp` and two shared devices (`6522via`, `imagedev/midiin`):
+
+| Change | Effect |
+|---|---|
+| CPU clock 1 MHz, VIA clock 2 MHz | Machine speed follows my reading of the board's clocks |
+| Two comment corrections | Filter address order, port B bit 4 |
+| `6522via` option plus the Mirage using it | The OS can clock its MIDI port: MIDI in and out work in the emulation |
+| `-kbdin file.mid` | Plays a MIDI file through a stand-in for the keyboard controller, so notes arrive the way a played key's do |
+| Filter model | An approximation of the CEM3328 voice filters |
+| ADC read-back | The OS's start-up filter calibration reads that model |
+| Copyright line | Adds the contributor to `copyright-holders` of `enmirage.cpp` |
+
+The filter model and ADC read-back are approximations tuned by hand, with constants that are assumed or taken from a datasheet. They change the sound for everyone and I have not compared them with a real instrument, so I do not claim they are right. With them on there is also a tone about 5 to 7 emulated seconds into an OS 3.2 boot that is not there without them.
+
+## Status: what has and has not been checked
+
+Checked, in the emulator only: it builds with no new warnings in the changed files; `-validate`; headless boots; runs over five OS disk images and four MIDI files; builds of every driver file that reaches the two shared devices.
+
+**Not checked: anything on a real Mirage.** The clock values, the keyboard protocol timings and the filter numbers are my readings and assumptions. Tested on macOS (Apple clang, arm64) only. Do not rely on this for anything where accuracy matters.
+
+## Build and run
+
+Build as MAME does (see MAME's documentation for the prerequisites on your system), in a path **without spaces**. For this driver only:
+
+```
+make SOURCES=src/mame/ensoniq/enmirage.cpp SUBTARGET=enmirage TOOLS=0 -j8
+```
+
+Put your ROM at `<romdir>/enmirage/mirage.bin` and run:
+
+```
+./enmirage enmirage -rompath <romdir>
+./enmirage enmirage -rompath <romdir> -flop1 <os-disk.img> -kbdin <notes.mid>
+```
+
+`-kbdin` refuses its file if the boot ROM does not have the velocity tables it expects; that is a message, not a crash. The Mirage OS and its disk images are Ensoniq's and are not included either.
+
+## What is not here
+
+No ROM, no disk image, no OS binary, no schematic and no text from Ensoniq documentation.
+
+## AI disclosure
+
+Claude (several models over time) assisted with the original patches and with turning them into this series. Every series commit says so in an `AI disclosure` line.
+
+## Licence
+
+Changes to `enmirage.cpp`, `midiin.cpp/.h` and `6522via.cpp/.h` are offered under those files' existing licences (BSD-3-Clause). The rest is MAME, under MAME's licences.
+
+---
+
 # MAME
 
 ## What is MAME?
