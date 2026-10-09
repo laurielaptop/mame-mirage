@@ -77,6 +77,7 @@
 #include "bus/midi/midi.h"
 #include "cpu/m6809/m6809.h"
 #include "formats/esq8_dsk.h"
+#include "formats/hxchfe_dsk.h"
 #include "imagedev/cassette.h"
 #include "imagedev/floppy.h"
 #include "imagedev/midiin.h"
@@ -1024,6 +1025,7 @@ void enmirage_state::floppy_formats(format_registration &fr)
 {
 	fr.add_mfm_containers();
 	fr.add(FLOPPY_ESQ8IMG_FORMAT);
+	fr.add(FLOPPY_HFE_FORMAT);
 }
 
 static void ensoniq_floppies(device_slot_interface &device)
