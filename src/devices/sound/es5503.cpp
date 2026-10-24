@@ -107,11 +107,11 @@ void es5503_device::halt_osc(int onum, int type, uint32_t *accumulator, int ress
 	{
 		if (!(onum & 1))
 		{
-			// we're even, so if the odd oscillator 1 below us is playing,
-			// restart it.
-			if (!(m_oscillators[onum - 1].control & 1))
+			// we're even, so if the odd oscillator 1 above us (our own
+			// partner, as on the real chip) is playing, restart it.
+			if (onum < 31 && !(m_oscillators[onum + 1].control & 1))
 			{
-				m_oscillators[onum - 1].accumulator = 0;
+				m_oscillators[onum + 1].accumulator = 0;
 			}
 		}
 
