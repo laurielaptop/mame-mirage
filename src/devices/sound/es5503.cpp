@@ -119,6 +119,16 @@ void es5503_device::halt_osc(int onum, int type, uint32_t *accumulator, int ress
 		mode = MODE_FREE;
 	}
 
+	// The data sheet wraps the accumulator modulo the full table size, once per
+	// table end.  The IIgs-derived code wrapped by size - 1, and wrapped a second
+	// time below when an even free-running oscillator had a swap-mode partner,
+	// which Mirage OS leaves behind at the end of every looped sample: the loop
+	// then read 2 bytes further each sample and played sharp.  Here a
+	// free-running oscillator wraps exactly once, by the full size, keeping the
+	// fractional phase.
+	const uint32_t wrap = uint32_t(pOsc->wtsize) << resshift;
+	bool wrapped = false;
+
 	// if 0 found in sample data or mode is not free-run, halt this oscillator
 	if ((mode != MODE_FREE) || (type != 0))
 	{
@@ -126,8 +136,8 @@ void es5503_device::halt_osc(int onum, int type, uint32_t *accumulator, int ress
 	}
 	else    // preserve the relative phase of the oscillator when looping
 	{
-		uint16_t wtsize = pOsc->wtsize - 1;
-		*accumulator -= (wtsize << resshift);
+		*accumulator -= wrap;
+		wrapped = true;
 	}
 
 	// if we're in swap mode, start the partner
@@ -145,9 +155,10 @@ void es5503_device::halt_osc(int onum, int type, uint32_t *accumulator, int ress
 		{
 			pOsc->control &= ~1;
 
-			// preserve the phase in this case too
-			uint16_t wtsize = pOsc->wtsize - 1;
-			*accumulator -= (wtsize << resshift);
+			// preserve the phase in this case too, unless the free-run
+			// branch above already wrapped this oscillator
+			if (!wrapped)
+				*accumulator -= wrap;
 		}
 	}
 	// IRQ enabled for this voice?
@@ -184,7 +195,7 @@ void es5503_device::sound_stream_update(sound_stream &stream)
 			{
 				uint32_t wtptr = pOsc->wavetblpointer & wavemasks[pOsc->wavetblsize], altram;
 				uint32_t acc = pOsc->accumulator;
-				const uint16_t wtsize = pOsc->wtsize - 1;
+				const uint32_t wtsize = pOsc->wtsize;
 				uint8_t ctrl = pOsc->control;
 				const uint16_t freq = pOsc->freq;
 				int16_t vol = pOsc->vol;
@@ -246,7 +257,9 @@ void es5503_device::sound_stream_update(sound_stream &stream)
 						}
 						mixp += m_output_channels;
 
-						if (altram >= wtsize)
+						// end of table: the next address (acc has already
+						// advanced) has run past the full table size
+						if ((acc >> resshift) >= wtsize)
 						{
 							halt_osc(osc, 0, &acc, resshift, pOsc->control);
 						}
